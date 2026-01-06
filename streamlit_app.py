@@ -271,6 +271,20 @@ else:
 if selected_exp and st.button("Calcular GEX/DEX"):
     with st.spinner("Obteniendo datos y calculando exposiciones..."):
         calls, puts = yf_get_calls_puts_for_exp(ticker, selected_exp)
+
+        # =======================================================
+        #  --- MÉTRICAS DE STRIKES DISPONIBLES ---
+        # =======================================================
+        if not calls.empty and not puts.empty:
+            total_strikes = pd.concat([
+                calls["strike"],
+                puts["strike"]
+            ]).nunique()
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("🎯 Strikes Totales", total_strikes)
+            col2.metric("📈 Calls", calls["strike"].nunique())
+            col3.metric("📉 Puts", puts["strike"].nunique())
         if calls is None or puts is None or calls.empty or puts.empty:
             st.error("No se pudieron obtener datos de opciones.")
         else:
@@ -278,7 +292,257 @@ if selected_exp and st.button("Calcular GEX/DEX"):
             df = compute_exposures(calls, puts, spot, 7, DEFAULT_R, DEFAULT_Q)
 
 
+
             st.plotly_chart(plot_gex_dex(df, spot), width="stretch")
+
+
+            # =======================================================
+            #  --- MÓDULO 5: MAPA DE FRAGILIDAD & ACELERACIÓN ---
+            # =======================================================
+            st.subheader("🧠 Mapa de Fragilidad & Aceleración (Dealer Stress Map)")
+
+            try:
+                # Calcular Gamma Slope (derivada discreta)
+                df_sorted = df.sort_values("strike").reset_index(drop=True)
+                df_sorted["gamma_slope"] = df_sorted["net_gex"].diff()
+
+                # Clasificación de zonas
+                def classify_zone(row):
+                    if abs(row["net_gex"]) > df_sorted["net_gex"].abs().quantile(0.75):
+                        return "STABLE"
+                    elif abs(row["gamma_slope"]) > df_sorted["gamma_slope"].abs().quantile(0.75):
+                        return "ACCELERATION"
+                    else:
+                        return "TRANSITION"
+
+                df_sorted["zone"] = df_sorted.apply(classify_zone, axis=1)
+
+                zone_colors = {
+                    "STABLE": "rgba(0,200,0,0.35)",
+                    "TRANSITION": "rgba(255,165,0,0.35)",
+                    "ACCELERATION": "rgba(255,0,0,0.35)"
+                }
+
+                import plotly.graph_objects as go
+                stress_fig = go.Figure()
+
+                stress_fig.add_bar(
+                    x=df_sorted["strike"],
+                    y=df_sorted["net_gex"],
+                    name="Net Gamma",
+                    marker_color="lightgray"
+                )
+
+                stress_fig.add_scatter(
+                    x=df_sorted["strike"],
+                    y=df_sorted["gamma_slope"],
+                    name="Gamma Slope",
+                    yaxis="y2",
+                    line=dict(color="cyan", width=2)
+                )
+
+                for zone, color in zone_colors.items():
+                    zone_df = df_sorted[df_sorted["zone"] == zone]
+                    if not zone_df.empty:
+                        stress_fig.add_vrect(
+                            x0=zone_df["strike"].min(),
+                            x1=zone_df["strike"].max(),
+                            fillcolor=color,
+                            opacity=0.15,
+                            layer="below",
+                            line_width=0,
+                        )
+
+                stress_fig.add_vline(
+                    x=spot,
+                    line_dash="dash",
+                    line_color="yellow",
+                    annotation_text="Spot",
+                    annotation_position="top right"
+                )
+
+                stress_fig.update_layout(
+                    template="plotly_dark",
+                    title="Dealer Stress Map — Fragilidad Implícita",
+                    height=550,
+                    yaxis=dict(title="Net Gamma"),
+                    yaxis2=dict(
+                        title="Gamma Slope",
+                        overlaying="y",
+                        side="right",
+                        showgrid=False
+                    ),
+                    legend=dict(orientation="h", y=1.05)
+                )
+
+            except Exception as e:
+                st.warning(f"No se pudo calcular el Mapa de Fragilidad: {e}")
+
+            else:
+
+                st.plotly_chart(stress_fig, use_container_width=True)
+
+            # =======================================================
+            #  🕳️ VACÍO DE CONTROL (Dealer / Gamma)
+            # =======================================================
+            st.subheader("🕳️ Vacío de Control — Dealer / Gamma")
+
+            # Definición:
+            # Zonas donde |Net GEX| es bajo → dealers no controlan el precio
+            if "net_gex" in df.columns:
+                void_threshold = df["net_gex"].abs().quantile(0.25)
+
+                void_df = df[df["net_gex"].abs() <= void_threshold].copy()
+
+                if not void_df.empty:
+                    import plotly.graph_objects as go
+
+                    void_fig = go.Figure()
+
+                    # Barras base de Net GEX
+                    void_fig.add_bar(
+                        x=df["strike"],
+                        y=df["net_gex"],
+                        name="Net GEX",
+                        marker_color="rgba(180,180,180,0.6)"
+                    )
+
+                    # Resaltar Vacíos de Control
+                    for _, row in void_df.iterrows():
+                        void_fig.add_vrect(
+                            x0=row["strike"] - 0.5,
+                            x1=row["strike"] + 0.5,
+                            fillcolor="rgba(120,120,120,0.25)",
+                            line_width=0
+                        )
+
+                    # Línea spot
+                    void_fig.add_vline(
+                        x=spot,
+                        line_dash="dash",
+                        line_color="yellow",
+                        annotation_text="Spot",
+                        annotation_position="top"
+                    )
+
+                    void_fig.update_layout(
+                        title="Vacío de Control (Gamma cercana a 0)",
+                        template="plotly_dark",
+                        height=420,
+                        yaxis_title="Net Gamma Exposure",
+                        xaxis_title="Strike",
+                        showlegend=False
+                    )
+
+                    st.plotly_chart(void_fig, use_container_width=True)
+
+                    # Tabla explicativa
+                    void_table = void_df[["strike", "net_gex"]].rename(columns={
+                        "strike": "Strike",
+                        "net_gex": "Net GEX"
+                    })
+
+                    st.caption("Zonas grises = ausencia de control dealer → posible aceleración direccional")
+                    st.dataframe(void_table, use_container_width=True)
+
+                else:
+                    st.info("No se detectaron Vacíos de Control para esta expiración.")
+
+                # ============================
+                # 🧠 Interpretación de Zonas (Modelo Condicional)
+                # ============================
+                st.markdown("""
+### 🧠 Cómo leer estas zonas (NO es dirección, es régimen)
+
+**🟥 Zona Roja — Aceleración**
+- Alta fragilidad del dealer.
+- El precio **no está obligado** a subir o bajar.
+- Si entra aquí: el movimiento **se acelera** en la dirección que ya lleve.
+- Requiere confirmación de otros módulos (GEX neto, Magnet Zones, Vol Implícita).
+
+**🟩 Zona Verde — Control**
+- Dealers con gamma positiva.
+- El precio tiende a **frenarse, balancearse o rebotar**.
+- Zona de estabilización estructural.
+
+**⬜ Zona Gris — Transición (Vacío estructural)**
+- Baja exposición implícita.
+- Nadie controla el precio.
+- El precio puede **recorrer toda la zona** sin fricción relevante.
+- Actúa como puente entre control (verde) y aceleración (rojo).
+
+> ⚠️ Importante:  
+> Estas zonas **NO predicen dirección**.  
+> Definen **qué tipo de comportamiento** esperar *si el precio entra ahí*.
+""")
+
+            # =======================================================
+            #  --- DETECTOR DE COLAPSO: ZONA GRIS → ROJA ---
+            # =======================================================
+            st.subheader("🚨 Detector de Colapso Estructural (Gray → Red)")
+
+            try:
+                collapse_df = df_sorted.copy()
+
+                # Métricas clave
+                collapse_df["abs_gex"] = collapse_df["net_gex"].abs()
+                collapse_df["abs_slope"] = collapse_df["gamma_slope"].abs()
+
+                gex_q = collapse_df["abs_gex"].quantile(0.25)
+                slope_q = collapse_df["abs_slope"].quantile(0.75)
+
+                def collapse_state(row):
+                    if row["abs_gex"] < gex_q and row["abs_slope"] > slope_q:
+                        return "⚠️ COLAPSO INMINENTE"
+                    elif row["abs_gex"] < gex_q:
+                        return "⚪ ZONA GRIS"
+                    elif row["abs_slope"] > slope_q:
+                        return "🔴 ZONA ROJA"
+                    else:
+                        return "🟢 ESTABLE"
+
+                collapse_df["estado"] = collapse_df.apply(collapse_state, axis=1)
+
+                # Tabla visual
+                def highlight_collapse(row):
+                    if "COLAPSO" in row["estado"]:
+                        return ["background-color: rgba(255,0,0,0.35); color:white;"] * len(row)
+                    if "ROJA" in row["estado"]:
+                        return ["background-color: rgba(255,0,0,0.20); color:white;"] * len(row)
+                    if "GRIS" in row["estado"]:
+                        return ["background-color: rgba(150,150,150,0.20); color:white;"] * len(row)
+                    return ["background-color: rgba(0,200,0,0.20); color:white;"] * len(row)
+
+                display_df = collapse_df[[
+                    "strike", "net_gex", "gamma_slope", "estado"
+                ]].sort_values("strike")
+
+                st.dataframe(
+                    display_df
+                    .style
+                    .apply(highlight_collapse, axis=1)
+                    .format({
+                        "net_gex": "${:,.0f}",
+                        "gamma_slope": "{:,.0f}"
+                    }),
+                    width="stretch"
+                )
+
+                # Conteo rápido
+                col1, col2, col3 = st.columns(3)
+                col1.metric("⚪ Zonas Grises", (collapse_df["estado"] == "⚪ ZONA GRIS").sum())
+                col2.metric("🔴 Zonas Rojas", (collapse_df["estado"] == "🔴 ZONA ROJA").sum())
+                col3.metric("🚨 Colapsos", (collapse_df["estado"] == "⚠️ COLAPSO INMINENTE").sum())
+
+                st.caption(
+                    "⚠️ Colapso = Gamma bajo + pendiente alta → aceleración sin control."
+                )
+
+            except Exception as e:
+                st.warning(f"No se pudo calcular el detector de colapso: {e}")
+
+            except Exception as e:
+                st.warning(f"No se pudo calcular el Mapa de Fragilidad: {e}")
 
             # =======================================================
             #  --- MAPA DE OPEN INTEREST (Barras Calls/Puts) ---
@@ -336,7 +600,330 @@ if selected_exp and st.button("Calcular GEX/DEX"):
             )
 
 
+
             st.plotly_chart(oi_fig, width="stretch")
+
+            # =======================================================
+            #  🧭 RUTA IMPLÍCITA DEL PRECIO (Forward-Looking)
+            # =======================================================
+            st.subheader("🧭 Ruta Implícita del Precio (Dealer / Gamma)")
+
+            # Este módulo NO predice dirección.
+            # Describe caminos probables del precio según:
+            # Control (Gamma alto) → Vacío → Aceleración
+
+            try:
+                route_df = df.sort_values("strike").reset_index(drop=True).copy()
+
+                # Métricas base
+                route_df["abs_gex"] = route_df["net_gex"].abs()
+                route_df["gamma_slope"] = route_df["net_gex"].diff().abs()
+
+                gex_low = route_df["abs_gex"].quantile(0.25)
+                gex_high = route_df["abs_gex"].quantile(0.75)
+                slope_high = route_df["gamma_slope"].quantile(0.75)
+
+                def route_zone(row):
+                    if row["abs_gex"] >= gex_high:
+                        return "CONTROL"
+                    elif row["abs_gex"] <= gex_low:
+                        return "VACÍO"
+                    elif row["gamma_slope"] >= slope_high:
+                        return "ACELERACIÓN"
+                    else:
+                        return "TRANSICIÓN"
+
+                route_df["route_zone"] = route_df.apply(route_zone, axis=1)
+
+                # Determinar zona actual del spot
+                nearest_idx = (route_df["strike"] - spot).abs().idxmin()
+                current_zone = route_df.loc[nearest_idx, "route_zone"]
+
+                # Construcción de rutas probables (arriba / abajo)
+                def build_path(start_idx, direction=1, steps=6):
+                    path = []
+                    idx = start_idx
+                    for _ in range(steps):
+                        idx += direction
+                        if idx < 0 or idx >= len(route_df):
+                            break
+                        path.append(route_df.loc[idx])
+                        if route_df.loc[idx, "route_zone"] == "CONTROL":
+                            break
+                    return path
+
+                up_path = build_path(nearest_idx, direction=1)
+                down_path = build_path(nearest_idx, direction=-1)
+
+                # Visualización
+                import plotly.graph_objects as go
+                route_fig = go.Figure()
+
+                # Base Net GEX
+                route_fig.add_bar(
+                    x=route_df["strike"],
+                    y=route_df["net_gex"],
+                    marker_color="rgba(180,180,180,0.5)",
+                    name="Net GEX"
+                )
+
+                zone_colors = {
+                    "CONTROL": "rgba(0,200,0,0.25)",
+                    "VACÍO": "rgba(160,160,160,0.25)",
+                    "ACELERACIÓN": "rgba(255,0,0,0.25)",
+                    "TRANSICIÓN": "rgba(255,165,0,0.20)"
+                }
+
+                for z, c in zone_colors.items():
+                    zdf = route_df[route_df["route_zone"] == z]
+                    if not zdf.empty:
+                        route_fig.add_vrect(
+                            x0=zdf["strike"].min(),
+                            x1=zdf["strike"].max(),
+                            fillcolor=c,
+                            line_width=0,
+                            layer="below"
+                        )
+
+                # Rutas
+                if up_path:
+                    route_fig.add_scatter(
+                        x=[p["strike"] for p in up_path],
+                        y=[p["net_gex"] for p in up_path],
+                        mode="lines+markers",
+                        line=dict(color="cyan", width=3),
+                        marker=dict(size=8),
+                        name="Ruta probable ↑"
+                    )
+
+                if down_path:
+                    route_fig.add_scatter(
+                        x=[p["strike"] for p in down_path],
+                        y=[p["net_gex"] for p in down_path],
+                        mode="lines+markers",
+                        line=dict(color="magenta", width=3),
+                        marker=dict(size=8),
+                        name="Ruta probable ↓"
+                    )
+
+                route_fig.add_vline(
+                    x=spot,
+                    line_color="yellow",
+                    line_dash="dash",
+                    annotation_text="Spot",
+                    annotation_position="top"
+                )
+
+                route_fig.update_layout(
+                    template="plotly_dark",
+                    height=520,
+                    title="Ruta Implícita del Precio (Control → Vacío → Aceleración)",
+                    xaxis_title="Strike",
+                    yaxis_title="Net Gamma Exposure",
+                    legend=dict(orientation="h", y=1.05),
+                    plot_bgcolor="#0e1621",
+                    paper_bgcolor="#0e1621"
+                )
+
+                st.plotly_chart(route_fig, width="stretch")
+
+                # Resumen textual institucional
+                st.markdown(f"""
+**Zona actual del precio:** `{current_zone}`  
+
+**Lectura estructural:**
+- Desde **CONTROL** → el precio tiende a frenarse o rotar.
+- Desde **VACÍO** → el precio puede recorrer strikes sin fricción.
+- Desde **ACELERACIÓN** → el movimiento se amplifica en la dirección previa.
+
+Este módulo **NO indica dirección**,  
+describe **qué tan lejos y cómo puede moverse el precio** una vez que entra en cada régimen.
+""")
+
+            except Exception as e:
+                st.warning(f"No se pudo calcular la Ruta Implícita del Precio: {e}")
+
+            # =======================================================
+            #  --- PANEL A: RÉGIMEN INSTITUCIONAL (IMPLÍCITO) ---
+            # =======================================================
+
+            st.subheader("🧭 Régimen Institucional Implícito")
+
+            # --- Métricas base ---
+            total_call_oi = calls["openInterest"].sum()
+            total_put_oi = puts["openInterest"].sum()
+
+            total_call_notional = (calls["openInterest"] * calls["lastPrice"] * 100).sum()
+            total_put_notional = (puts["openInterest"] * puts["lastPrice"] * 100).sum()
+
+            net_notional = total_call_notional - total_put_notional
+
+            # Gamma regime
+            if net_notional > 0:
+                gamma_regime = "Dealer Long Gamma (Control / Mean Reversion)"
+                gamma_color = "rgba(0,200,0,0.15)"
+            else:
+                gamma_regime = "Dealer Short Gamma (Expansión / Riesgo)"
+                gamma_color = "rgba(200,0,0,0.15)"
+
+            # --- Mostrar métricas clave ---
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.metric(
+                    label="📈 Notional CALLS",
+                    value=f"${total_call_notional:,.0f}"
+                )
+
+            with col2:
+                st.metric(
+                    label="📉 Notional PUTS",
+                    value=f"${total_put_notional:,.0f}"
+                )
+
+            with col3:
+                st.metric(
+                    label="⚖️ Net Notional",
+                    value=f"${net_notional:,.0f}"
+                )
+
+            # --- Caja visual de régimen ---
+            st.markdown(
+                f"""
+                <div style="
+                    padding:16px;
+                    border-radius:12px;
+                    background-color:{gamma_color};
+                    border:1px solid rgba(255,255,255,0.15);
+                    margin-top:10px;
+                ">
+                    <strong>Régimen Actual:</strong><br>
+                    {gamma_regime}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            # --- Conteo estructural ---
+            st.caption(
+                f"Strikes analizados → CALLS: {len(calls)} | PUTS: {len(puts)} | Total: {len(calls)+len(puts)}"
+            )
+
+            # =======================================================
+            #  --- PARTE 2: MAPA DE PRESIÓN IMPLÍCITA POR STRIKE ---
+            # =======================================================
+            st.subheader("🧲 Mapa de Presión Implícita por Strike")
+
+            # Construir DataFrame institucional
+            inst_df = pd.concat([
+                pd.DataFrame({
+                    "strike": calls["strike"],
+                    "type": "CALL",
+                    "notional": calls["openInterest"] * calls["lastPrice"] * 100
+                }),
+                pd.DataFrame({
+                    "strike": puts["strike"],
+                    "type": "PUT",
+                    "notional": puts["openInterest"] * puts["lastPrice"] * 100
+                })
+            ], ignore_index=True)
+
+            pressure_df = inst_df.copy()
+
+            # Presión firmada: CALLS positivos, PUTS negativos
+            pressure_df["signed_notional"] = pressure_df.apply(
+                lambda r: r["notional"] if r["type"] == "CALL" else -r["notional"],
+                axis=1
+            )
+
+            # Agregación por strike
+            strike_pressure = (
+                pressure_df
+                .groupby("strike", as_index=False)
+                .agg(
+                    call_notional=("notional", lambda x: x[pressure_df.loc[x.index, "type"] == "CALL"].sum()),
+                    put_notional=("notional", lambda x: x[pressure_df.loc[x.index, "type"] == "PUT"].sum()),
+                    net_pressure=("signed_notional", "sum")
+                )
+            )
+
+            # Clasificación estructural
+            def classify_zone(row):
+                if abs(row["net_pressure"]) < strike_pressure["net_pressure"].abs().quantile(0.25):
+                    return "VACÍO"
+                elif row["net_pressure"] > 0:
+                    return "SOPORTE (Gamma+)"
+                else:
+                    return "RESISTENCIA (Gamma-)"
+
+            strike_pressure["zone"] = strike_pressure.apply(classify_zone, axis=1)
+
+            # Ordenar por presión absoluta
+            strike_pressure = strike_pressure.sort_values(
+                by="net_pressure", key=lambda x: x.abs(), ascending=False
+            )
+
+            def highlight_pressure(row):
+                if row["zone"] == "SOPORTE (Gamma+)":
+                    return ["background-color: rgba(0,200,0,0.18); color:white;"] * len(row)
+                elif row["zone"] == "RESISTENCIA (Gamma-)":
+                    return ["background-color: rgba(200,0,0,0.18); color:white;"] * len(row)
+                return ["background-color: rgba(120,120,120,0.15); color:white;"] * len(row)
+
+            st.dataframe(
+                strike_pressure.style
+                    .apply(highlight_pressure, axis=1)
+                    .format({
+                        "call_notional": "${:,.0f}",
+                        "put_notional": "${:,.0f}",
+                        "net_pressure": "${:,.0f}",
+                    }),
+                use_container_width=True
+            )
+
+            # =======================================================
+            #  --- PARTE 3: SÍNTESIS PREDICTIVA IMPLÍCITA ---
+            # =======================================================
+            st.subheader("🧠 Síntesis Predictiva — Estructura Implícita")
+
+            total_call_notional = strike_pressure["call_notional"].sum()
+            total_put_notional = strike_pressure["put_notional"].sum()
+            net_structural = strike_pressure["net_pressure"].sum()
+
+            if net_structural > 0:
+                regime = "📗 Mercado Controlado (Dealers Long Gamma)"
+                expectation = "Compresión / Mean Reversion / Falsos breakouts"
+            elif net_structural < 0:
+                regime = "📕 Mercado Inestable (Dealers Short Gamma)"
+                expectation = "Expansión / Movimientos rápidos / Riesgo direccional"
+            else:
+                regime = "🟨 Mercado Neutral"
+                expectation = "Indecisión estructural"
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.metric("Call Notional Total", f"${total_call_notional:,.0f}")
+
+            with col2:
+                st.metric("Put Notional Total", f"${total_put_notional:,.0f}")
+
+            with col3:
+                st.metric("Net Implícito", f"${net_structural:,.0f}")
+
+            st.info(f"""
+            **Régimen Detectado:** {regime}  
+            **Expectativa Implícita:** {expectation}
+
+            Este modelo **NO usa precios pasados**,  
+            **NO usa volumen histórico**,  
+            y **NO depende de price action**.
+
+            Lee exclusivamente:
+            • Posicionamiento implícito  
+            • Presión nocional  
+            • Estructura futura del mercado
+            """)
 
             # =======================================================
             #  --- MAPA COMBINADO OI vs NET GEX ---
@@ -865,6 +1452,112 @@ if selected_exp and st.button("Calcular GEX/DEX"):
 
             st.subheader("📋 Tabla de resumen")
             st.dataframe(summary_df, width="stretch")
+
+            # =======================================================
+            #  --- PROBABILIDAD IMPLÍCITA DE TOUCH (Forward-Looking) ---
+            # =======================================================
+
+            from scipy.stats import norm
+            import numpy as np
+
+            dte = (pd.to_datetime(selected_exp) - pd.Timestamp.today()).days
+            T = max(dte, 1) / 365
+
+            touch_rows = []
+
+            for _, row in calls.iterrows():
+                K = row["strike"]
+                iv = row["impliedVolatility"]
+                if iv > 0 and spot > 0:
+                    d = abs(np.log(K / spot)) / (iv * np.sqrt(T))
+                    prob_touch = 2 * (1 - norm.cdf(d)) * 100
+                    touch_rows.append({
+                        "Strike": K,
+                        "Prob Touch": min(prob_touch, 100)
+                    })
+
+            touch_df = (
+                pd.DataFrame(touch_rows)
+                .groupby("Strike", as_index=False)
+                .mean()
+            )
+
+            # =======================================================
+            #  --- MAGNET ZONES (FORWARD-LOOKING STRIKES) ---
+            # =======================================================
+            st.subheader("🧲 Magnet Zones — Strikes de Atracción Implícita")
+
+            mag_df = df.copy()
+
+            # Unir probabilidad de touch
+            mag_df = mag_df.merge(
+                touch_df[["Strike", "Prob Touch"]],
+                left_on="strike",
+                right_on="Strike",
+                how="left"
+            )
+
+            # Notional total proxy (gamma-weighted)
+            mag_df["total_notional"] = (
+                    mag_df["call_gex"].abs() +
+                    mag_df["put_gex"].abs()
+            )
+
+            # Magnet Score (forward-looking puro)
+            mag_df["magnet_score"] = (
+                    (mag_df["Prob Touch"] / 100)
+                    * mag_df["total_notional"]
+                    * mag_df["net_gex"].abs()
+            )
+
+            # Limpiar valores inválidos
+            mag_df = mag_df.replace([np.inf, -np.inf], np.nan).dropna(
+                subset=["magnet_score"]
+            )
+
+            # Filtro alrededor del spot
+            mag_df = mag_df[
+                (mag_df["strike"] >= spot * 0.8) &
+                (mag_df["strike"] <= spot * 1.2)
+                ]
+
+            # Ordenar por fuerza magnética
+            mag_df = mag_df.sort_values("magnet_score", ascending=False)
+
+            display_df = mag_df[[
+                "strike",
+                "Prob Touch",
+                "net_gex",
+                "total_notional",
+                "magnet_score"
+            ]].head(15)
+
+
+            # Estilo visual institucional
+            def highlight_magnet(row):
+                if row["magnet_score"] >= display_df["magnet_score"].quantile(0.9):
+                    return ["background-color: rgba(255,0,0,0.30); color:white;"] * len(row)
+                elif row["magnet_score"] >= display_df["magnet_score"].quantile(0.6):
+                    return ["background-color: rgba(255,165,0,0.25); color:white;"] * len(row)
+                return ["background-color: rgba(255,255,255,0.05); color:white;"] * len(row)
+
+
+            styled_magnet = display_df.style.apply(
+                highlight_magnet, axis=1
+            ).format({
+                "strike": "{:,.0f}",
+                "Prob Touch": "{:.1f}%",
+                "net_gex": "{:,.0f}",
+                "total_notional": "{:,.0f}",
+                "magnet_score": "{:.2e}"
+            })
+
+            st.dataframe(styled_magnet, use_container_width=True)
+
+            st.caption(
+                "🧲 Magnet Zones combinan Probabilidad Implícita de Touch, "
+                "Gamma y Notional. No indican dirección, solo atracción estructural."
+            )
 
             # =======================================================
             #  --- ESCÁNER DE OPCIONES ---
